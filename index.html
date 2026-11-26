@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Spectral Dispersion Lab</title>
+  <link rel="stylesheet" href="./src/ui/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot"></span>
+      <h1>Spectral Dispersion Lab</h1>
+      <span class="sub">wavelength-resolved light transport &rarr; CIE 1931 &rarr; display</span>
+    </div>
+    <div class="topstats" id="topstats"></div>
+  </header>
+
+  <main class="layout">
+    <section class="panel controls" aria-label="Light and optics controls">
+      <h2>Source &amp; filter</h2>
+      <div class="field">
+        <label for="lamp">Lamp</label>
+        <select id="lamp">
+          <option value="wide">Wide band &mdash; Planck continuum</option>
+          <option value="narrow">Narrow band &mdash; 3 lines (same white)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="filterKind">Filter after prism</label>
+        <select id="filterKind">
+          <option value="clear">Clear (no filter)</option>
+          <option value="bandpass">Narrow band-pass</option>
+        </select>
+      </div>
+      <div class="field" id="filterRow">
+        <label for="filterCenter">Passband center (nm)</label>
+        <div class="inline">
+          <input id="filterCenter" type="range" min="400" max="700" step="1" value="450" />
+          <output id="filterCenterVal">450</output>
+        </div>
+      </div>
+      <div class="field" id="filterWidthRow">
+        <label for="filterWidth">Passband width (nm)</label>
+        <div class="inline">
+          <input id="filterWidth" type="range" min="4" max="80" step="1" value="14" />
+          <output id="filterWidthVal">14</output>
+        </div>
+      </div>
+
+      <h2>Prism</h2>
+      <div class="field">
+        <label for="material">Glass (Sellmeier catalogue)</label>
+        <select id="material">
+          <option value="N-SF11" selected>N-SF11 (high dispersion, Abbe 26)</option>
+          <option value="N-BK7">N-BK7 (low dispersion, Abbe 64)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="dispersion">Dispersion model</label>
+        <select id="dispersion">
+          <option value="catalogue">Catalogue Sellmeier (dispersive)</option>
+          <option value="constant">Constant index at nd (no dispersion)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="apex">Apex angle (deg)</label>
+        <div class="inline">
+          <input id="apex" type="range" min="30" max="60" step="1" value="55" />
+          <output id="apexVal">55</output>
+        </div>
+      </div>
+      <div class="field">
+        <label for="incidence">Incidence angle (deg, from face normal)</label>
+        <div class="inline">
+          <input id="incidence" type="range" min="20" max="80" step="0.5" value="50" />
+          <output id="incidenceVal">50</output>
+        </div>
+      </div>
+      <div class="field">
+        <label for="optics">Optical element</label>
+        <select id="optics">
+          <option value="prism">Prism</option>
+          <option value="none">None (vacuum path)</option>
+        </select>
+      </div>
+
+      <h2>Wavelength sampling</h2>
+      <div class="field">
+        <label for="sampling">Proposal density</label>
+        <select id="sampling">
+          <option value="uniform">Uniform in wavelength</option>
+          <option value="energy">Energy-stratified (source &times; throughput &times; ybar)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="samples">Initial samples</label>
+        <div class="inline">
+          <input id="samples" type="range" min="500" max="20000" step="500" value="5000" />
+          <output id="samplesVal">5000</output>
+        </div>
+      </div>
+      <div class="actions">
+        <button id="resample" class="primary">Re-sample from scratch</button>
+        <button id="supplement">Supplement unsupported bands</button>
+      </div>
+      <p class="hint" id="accumHint"></p>
+    </section>
+
+    <section class="panel viz" aria-label="Light path and spectrum">
+      <div class="canvasWrap">
+        <canvas id="scene" width="760" height="560"></canvas>
+        <div class="legend" id="sceneLegend"></div>
+      </div>
+      <div class="spectrumWrap">
+        <canvas id="spectrum" width="760" height="190"></canvas>
+      </div>
+    </section>
+
+    <section class="panel result" aria-label="Observed screen">
+      <h2>Observed screen</h2>
+      <div class="screenWrap">
+        <canvas id="observed" width="300" height="420"></canvas>
+        <div class="screenAxis">
+          <span class="axisTop">+y</span>
+          <span id="screenRange" class="axisMid"></span>
+          <span class="axisBot">&minus;y</span>
+        </div>
+      </div>
+      <div class="swatchBlock">
+        <div class="swatch" id="screenSwatch"></div>
+        <div class="swatchText" id="screenColorText"></div>
+      </div>
+      <dl class="stats" id="resultStats"></dl>
+    </section>
+
+    <section class="panel table" aria-label="Wavelength contributions">
+      <div class="tableHead">
+        <h2>Energy &amp; wavelength contributions</h2>
+        <div class="tableFilters">
+          <label><input type="radio" name="tableScope" value="estimate" checked /> estimate (MIS)</label>
+          <label><input type="radio" name="tableScope" value="reference" /> independent scan</label>
+        </div>
+      </div>
+      <div class="tableScroll">
+        <table id="contrib">
+          <thead>
+            <tr>
+              <th>lambda (nm)</th>
+              <th>batch</th>
+              <th>pdf (1/nm)</th>
+              <th>L (rel)</th>
+              <th>T (path)</th>
+              <th>filter</th>
+              <th>screen y</th>
+              <th>X / Y / Z</th>
+              <th>colour</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="hint">Colour chips are the integrated XYZ of a single sample under the current output transform, not a raw wavelength-to-RGB ramp.</p>
+    </section>
+
+    <section class="panel checks" aria-label="Verification">
+      <h2>Verification</h2>
+      <div id="checkList" class="checkList"></div>
+    </section>
+  </main>
+
+  <div id="fatal" class="fatal" hidden></div>
+  <script type="module" src="./src/app/main.js"></script>
+</body>
+</html>
