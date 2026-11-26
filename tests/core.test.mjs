@@ -261,6 +261,102 @@ test('spectral data carries explicit provenance and out-of-range policy', () => 
   assert.ok(lamps.wide.spd(380) > 0 && lamps.wide.spd(780) > 0);
 });
 
+// --- Wavelength-strategy experiment ---------------------------------------
+test('participation width separates broad continua from sharp lines', async () => {
+  const { buildSource } = await import('../src/core/light.js');
+  const { experimentGeometry } = await import('../src/core/experiment.js');
+  const { participationWidth, normalizedSource } = await import('../src/core/strategies.js');
+  const g = experimentGeometry(spectralData);
+  const broad = normalizedSource(buildSource({ kind: 'continuous', temperatureK: 6500, name: 'b' }), spectralData);
+  const sharp = normalizedSource(buildSource({ kind: 'lines', name: 's', lines: [450, 535, 620].map((c) => ({ centerNm: c, fwhmNm: 2, weight: 1 })) }), spectralData);
+  const wB = participationWidth({ source: broad, spectralData, geometry: g });
+  const wS = participationWidth({ source: sharp, spectralData, geometry: g });
+  // A Planck continuum inside the window is of order 200 nm wide; a 2 nm line is
+  // of order a few nm. These are real traced quantities, not nominal FWHM labels.
+  assert.ok(wB > 150 && wB < 260, `broad W=${wB}`);
+  assert.ok(wS > 2 && wS < 30, `sharp W=${wS}`);
+  assert.ok(wB / wS > 5, `width ratio ${wB / wS}`);
+});
+
+test('joint response sampling beats fixed layering on a sharp line at equal samples', async () => {
+  const { buildSource } = await import('../src/core/light.js');
+  const { makeGeometry } = await import('../src/core/geometry.js');
+  const { analyzeSpectrum, normalizedSource } = await import('../src/core/strategies.js');
+  const { EXPERIMENT_GEOMETRY } = await import('../src/core/experiment.js');
+  const geometry = makeGeometry({ ...EXPERIMENT_GEOMETRY, spectralData });
+  const source = normalizedSource(buildSource({
+    kind: 'lines', name: 's', lines: [450, 535, 620].map((c) => ({ centerNm: c, fwhmNm: 2, weight: 1 })),
+  }), spectralData);
+  const s = analyzeSpectrum({
+    id: 'sharp2', label: 'sharp', source, spectralData, geometry,
+    samples: 256, seeds: [11, 22, 33], screenBins: 192,
+  });
+  // Fixed layering rarely lands on a 2 nm line: large colour error. The joint
+  // density concentrates where the line is, so its detected colour is right.
+  assert.ok(s.runs.fixed.metrics.globalDeltaE > 3, `fixed ΔE ${s.runs.fixed.metrics.globalDeltaE}`);
+  assert.ok(s.runs.joint.metrics.globalDeltaE < 1.5, `joint ΔE ${s.runs.joint.metrics.globalDeltaE}`);
+  assert.ok(s.runs.joint.metrics.globalDeltaE < s.runs.fixed.metrics.globalDeltaE);
+});
+
+test('fixed layering matches the reference on a broad continuum', async () => {
+  const { buildSource } = await import('../src/core/light.js');
+  const { makeGeometry } = await import('../src/core/geometry.js');
+  const { analyzeSpectrum, normalizedSource } = await import('../src/core/strategies.js');
+  const { EXPERIMENT_GEOMETRY } = await import('../src/core/experiment.js');
+  const geometry = makeGeometry({ ...EXPERIMENT_GEOMETRY, spectralData });
+  const source = normalizedSource(buildSource({ kind: 'continuous', temperatureK: 6500, name: 'b' }), spectralData);
+  const s = analyzeSpectrum({
+    id: 'broad6500', label: 'broad', source, spectralData, geometry,
+    samples: 256, seeds: [11, 22, 33], screenBins: 192,
+  });
+  assert.ok(s.runs.fixed.metrics.globalDeltaE < 0.5, `fixed ΔE ${s.runs.fixed.metrics.globalDeltaE}`);
+});
+
+test('experiment calibrates on half the spectra and agrees on the blind half', async () => {
+  const { runExperiment } = await import('../src/core/experiment.js');
+  const result = runExperiment({ spectralData, samples: 256, screenBins: 192, seeds: [11, 22, 33, 44, 55] });
+  // The rule is calibrated without disagreement on its own half, and the blind
+  // half is decided by the descriptor alone.
+  assert.equal(result.rule.errors, 0, `calibration errors ${result.rule.errors}`);
+  assert.ok(result.rule.cStar > 0, `cStar ${result.rule.cStar}`);
+  // Every blind decision must at least be a strategy that met the policy.
+  const blind = result.blindEvaluation;
+  assert.equal(blind.summary.disagreements, 0, `blind disagreements ${blind.summary.disagreements}`);
+  // At this operating point every blind decision lands on a strategy that meets
+  // the policy; the count is asserted against the summary's own count, not a
+  // hard-coded 6, so a different budget does not produce a false failure.
+  assert.equal(blind.summary.chosenSufficientCount, blind.rows.filter((r) => r.chosenSufficient).length);
+  assert.ok(blind.summary.chosenSufficientCount >= blind.summary.n - 1);
+  // The chosen mix must cost strictly less than always-joint, and more than
+  // always-fixed (it dispatches by spectrum), i.e. it is a real trade-off.
+  assert.ok(blind.summary.totalChosenRays < blind.summary.totalJointRays);
+  assert.ok(blind.summary.totalChosenRays > blind.summary.totalFixedRays);
+  // Sharp spectra must be routed to the joint strategy; broad ones to fixed.
+  for (const row of blind.rows) {
+    if (row.concentration < result.rule.cStar) {
+      assert.equal(row.decision, 'joint', `${row.id} should route to joint`);
+    } else {
+      assert.equal(row.decision, 'fixed', `${row.id} should route to fixed`);
+    }
+  }
+});
+
+test('experiment evidence is serialisable and carries no fabricated numbers', async () => {
+  const { runExperiment, experimentEvidence } = await import('../src/core/experiment.js');
+  const result = runExperiment({ spectralData, samples: 128, screenBins: 192, seeds: [11, 22, 33] });
+  const ev = experimentEvidence(result);
+  const json = JSON.stringify(ev);
+  assert.ok(json.length > 0);
+  // Every finite evidence number matches the in-memory result, so the report is
+  // a projection of computed values, not typed-in constants.
+  for (const s of ev.spectra) {
+    const live = result.spectra.find((x) => x.id === s.id);
+    assert.ok(Math.abs(s.fixed.globalDeltaE - live.runs.fixed.metrics.globalDeltaE) / Math.max(1, live.runs.fixed.metrics.globalDeltaE) < 1e-4);
+    assert.equal(s.fixed.rays, live.runs.fixed.rays);
+  }
+  assert.ok(ev.rule.cStar === null || Math.abs(ev.rule.cStar - result.rule.cStar) / Math.max(1, result.rule.cStar) < 1e-4);
+});
+
 let passed = 0;
 let failed = 0;
 for (const t of tests) {

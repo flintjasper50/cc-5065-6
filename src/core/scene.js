@@ -53,16 +53,38 @@ export function sourceById(lamps, id) {
 }
 
 // Build the wavelength proposal for a scene.
-//  - 'uniform'  : flat over the window; filter-agnostic (the naive baseline).
+//  - 'uniform'  : flat over the window; filter-agnostic. This is the fixed
+//                 wavelength layering baseline (independent, constant density).
 //  - 'energy'   : source x geometry throughput x current filter x ybar. Because
 //                 it is conditioned on the active filter, changing to a distant
 //                 passband leaves the old samples with no support exactly there;
 //                 that is what the accumulate/re-estimate path must detect, not
 //                 paper over. The proposal is recorded with its density, so MIS
 //                 reweighting of old samples stays unbiased.
+//  - 'joint'    : source x geometry throughput x current filter x (x+y+z). This is
+//                 the restricted correlated proposal: it conditions on both the
+//                 source and the observer, so it clusters samples where the
+//                 detected energy is. It uses the full CMF sum rather than ybar
+//                 alone so the blue and red channels are not starved — a ybar-only
+//                 density is exactly the shortcut that raises chromaticity error on
+//                 broad spectra. The production render can use it, not just the
+//                 experiment.
 export function makeProposal(source, spectralData, strategy, { geometry, filter, lambdaMin, lambdaMax }) {
   if (strategy === 'uniform') {
     return uniformSampler(lambdaMin, lambdaMax, { resolution: 0.25 });
+  }
+  if (strategy === 'joint') {
+    const fn = (lambda) => {
+      const L = source.spd(lambda);
+      if (!(L > 0)) return 0;
+      const tr = geometry.trace(lambda);
+      if (!tr.ok || !(tr.T > 0)) return 0;
+      const f = filter ? filter.transmission(lambda) : 1;
+      if (!(f > 0)) return 0;
+      const cmf = spectralData.cmf(lambda);
+      return L * tr.T * f * (cmf[0] + cmf[1] + cmf[2]);
+    };
+    return new DensitySampler(fn, { lambdaMin, lambdaMax, resolution: 0.25, kind: 'joint' });
   }
   const fn = energyDensityFn(source, spectralData, {
     geometry,

@@ -10,6 +10,9 @@ import { deltaE76, xyOfXyz, wavelengthLabelRgb } from '../core/colorimetry.js';
 import { drawSceneBase, drawSamplePaths, renderScreen, viewToCanvas, fitView } from '../render.js';
 import { drawSourcePlot, clearCanvas } from '../ui/plots.js';
 import { runChecks } from '../ui/checks.js';
+import { runStrategy } from '../core/strategies.js';
+import { calibrateAtBudget } from '../core/experiment.js';
+import { drawDispersionFrame, drawContributionChart, displayForReference, frameAnomalies } from '../ui/strategy-panel.js';
 
 const THEME = {
   screen: '#05070b',
@@ -37,6 +40,8 @@ const state = {
   sampling: 'uniform',
   samples: 5000,
   tableScope: 'estimate',
+  strategyBudget: 500,
+  strategyAuto: false,
 };
 
 let core = null; // { spectralData, lamps }
@@ -45,6 +50,7 @@ let lastEstimate = null;
 let lastReference = null;
 let lastError = null;
 let stale = false;
+let strategyComparison = null; // { runs, rule, reference, anomalies, ... }
 
 const el = (id) => document.getElementById(id);
 
@@ -95,6 +101,11 @@ function bindControls() {
   rangeControl('samples', 'samplesVal', (v) => { state.samples = v; rebuild(); });
   el('resample').addEventListener('click', () => rebuild({ forceResample: true }));
   el('supplement').addEventListener('click', () => supplementBands());
+  el('runStrategyCompare').addEventListener('click', () => runStrategyComparison());
+  el('strategyAuto').addEventListener('change', (e) => {
+    state.strategyAuto = e.target.checked;
+    if (state.strategyAuto && strategyComparison) applyAutoSwitch();
+  });
   for (const r of document.querySelectorAll('input[name="tableScope"]')) {
     r.addEventListener('change', (e) => {
       state.tableScope = e.target.value;
@@ -133,6 +144,8 @@ function syncControls() {
   el('sampling').value = state.sampling;
   el('samples').value = String(state.samples);
   el('samplesVal').textContent = String(state.samples);
+  el('strategyBudget').textContent = String(state.strategyBudget);
+  el('strategyAuto').checked = state.strategyAuto;
   syncFilterVisibility();
 }
 
@@ -207,6 +220,7 @@ function rebuild({ initial = false, forceResample = false } = {}) {
     scene = next;
     stale = false;
     compute();
+    invalidateStrategyComparison('scene changed');
   } catch (err) {
     console.error(err);
     lastError = err;
@@ -259,6 +273,233 @@ function markStale(msg) {
   stale = true;
   el('accumHint').textContent = msg;
   el('accumHint').classList.add('err');
+}
+
+// ---------------------------------------------------------------------------
+// Wavelength-strategy comparison (live, in this window)
+// ---------------------------------------------------------------------------
+// The comparison is intentionally not cheap: building the joint density traces
+// every grid wavelength, so it runs on explicit request (or auto-switch) rather
+// than on every slider move. The run state is shown in the panel so the window
+// never silently shows a stale comparison as if it were live.
+
+function setStrategyState(kind, text) {
+  const box = el('strategyState');
+  box.className = `strategyState ${kind}`;
+  box.innerHTML = `<span class="lamp"></span><span>${escapeHtml(text)}</span>`;
+}
+
+function invalidateStrategyComparison(reason) {
+  if (!strategyComparison) return;
+  strategyComparison.stale = true;
+  setStrategyState('', `idle — comparison stale (${reason}); re-run to compare the current light`);
+  el('strategyVerdict').innerHTML = `<span class="verdictWarn">Comparison is stale: the source, filter, prism or sample budget changed after it was computed. Run it again to see the current dispersion frames.</span>`;
+}
+
+function runStrategyComparison() {
+  if (!scene) return;
+  setStrategyState('running', 'running both proposals on the traced prism…');
+  el('strategyVerdict').innerHTML = '';
+  // Defer one frame so the running state paints before the (synchronous) work.
+  setTimeout(() => {
+    try {
+      computeStrategyComparison();
+    } catch (err) {
+      console.error(err);
+      setStrategyState('err', `error: ${err?.message ?? err}`);
+      el('strategyVerdict').innerHTML = `<span class="verdictErr">${escapeHtml(String(err?.message ?? err))}</span>`;
+    }
+  }, 30);
+}
+
+function computeStrategyComparison() {
+  const { spectralData } = core;
+  // Use the current scene's own geometry/source/filter so the comparison is about
+  // *this* light, not the experiment family. The traced prism is the real one.
+  const source = scene.source;
+  const filter = scene.filter;
+  const geometry = scene.geometry;
+  const samples = state.strategyBudget;
+
+  // Shared independence reference at a moderate screen resolution so per-bin
+  // coverage and per-pixel colour are meaningful without over-sampling noise.
+  const layout = existingStrategyScreen(geometry, filter);
+  const reference = referenceScan({ source, spectralData, geometry, filter, step: 0.5 });
+  const screen = layout;
+  const referenceImage = referenceScreen({
+    source, spectralData, geometry, filter, step: 0.5,
+    yMin: screen.yMin, yMax: screen.yMax, bins: screen.count,
+  });
+  const shared = { reference, referenceImage };
+
+  const seeds = [11, 22, 33];
+  const aggRuns = {};
+  for (const strategy of ['fixed', 'joint']) {
+    const perSeed = seeds.map((seed) => runStrategy({
+      source, spectralData, geometry, filter, strategy, samples, seed, screen, shared,
+    }));
+    // Choose a representative run (nearest to mean global ΔE) for drawing.
+    const meanG = perSeed.reduce((a, r) => a + r.metrics.globalDeltaE, 0) / perSeed.length;
+    let rep = perSeed[0];
+    let best = Infinity;
+    for (const r of perSeed) {
+      const d = Math.abs(r.metrics.globalDeltaE - meanG);
+      if (d < best) { best = d; rep = r; }
+    }
+    const metrics = {
+      globalDeltaE: meanG,
+      pixelDeltaE: perSeed.reduce((a, r) => a + r.metrics.pixelDeltaE, 0) / perSeed.length,
+      compositeDeltaE: perSeed.reduce((a, r) => a + r.metrics.compositeDeltaE, 0) / perSeed.length,
+      omission: perSeed.reduce((a, r) => a + r.metrics.omission, 0) / perSeed.length,
+      darkBins: perSeed.reduce((a, r) => a + r.metrics.darkBins, 0) / perSeed.length,
+      litBins: rep.metrics.litBins,
+      bandCoverage: perSeed.reduce((a, r) => a + r.metrics.bandCoverage, 0) / perSeed.length,
+      unresolved: perSeed.some((r) => r.metrics.unresolved),
+    };
+    aggRuns[strategy] = { ...rep, metrics, perSeed };
+  }
+
+  // Calibrate the switch threshold at this budget, using the in-repo calibration
+  // family only. This is the same rule the CLI experiment reports.
+  let rule = null;
+  try {
+    rule = calibrateAtBudget({ spectralData, samples, seeds, screenBins: screen.count });
+  } catch (err) {
+    console.error('calibration failed', err);
+  }
+
+  // Descriptor of the *current* light: participation width and concentration.
+  const width = participationWidthOf(source, geometry);
+  const c = samples > 0 ? (samples * width) / (780 - 380) : 0;
+
+  const anomalies = {
+    fixed: frameAnomalies(aggRuns.fixed.estimate, referenceImage),
+    joint: frameAnomalies(aggRuns.joint.estimate, referenceImage),
+  };
+
+  strategyComparison = {
+    runs: aggRuns, reference, referenceImage, screen, anomalies,
+    rule, width, concentration: c, samples,
+    sourceLabel: `${scene.source.name ?? scene.source.kind}`,
+    geometryLabel: scene.geometry.describe,
+    stale: false,
+  };
+  renderStrategyComparison();
+}
+
+// Screen framing for the comparison. Uses the reference landing range so both
+// strategies share the exact same bins (a fair per-bin comparison).
+function existingStrategyScreen(geometry, filter) {
+  const reference = referenceScan({
+    source: scene.source, spectralData: core.spectralData, geometry, filter, step: 0.75,
+  });
+  const range = reference.screenRange;
+  if (!range) return { yMin: VIEW.yMin, yMax: VIEW.yMax, count: 160 };
+  const span = range[1] - range[0];
+  const pad = Math.max(1e-3, span * 0.15);
+  return { yMin: range[0] - pad, yMax: range[1] + pad, count: 160 };
+}
+
+function participationWidthOf(source, geometry) {
+  const spectralData = core.spectralData;
+  let s = 0, s2 = 0;
+  const step = 1.0;
+  for (let l = 380; l <= 780; l += step) {
+    const L = source.spd(l);
+    if (!(L > 0)) continue;
+    const tr = geometry.trace(l);
+    if (!tr.ok || !(tr.T > 0)) continue;
+    const cmf = spectralData.cmf(l);
+    const response = cmf[0] + cmf[1] + cmf[2];
+    if (!(response > 0)) continue;
+    const w = L * tr.T * response;
+    s += w; s2 += w * w;
+  }
+  return s > 0 ? (s * s / s2) * step : 0;
+}
+
+function renderStrategyComparison() {
+  if (!strategyComparison) return;
+  const { runs, reference, referenceImage, screen, anomalies, rule, width, concentration, samples } = strategyComparison;
+
+  for (const strategy of ['fixed', 'joint']) {
+    const run = runs[strategy];
+    const display = displayForReference(reference);
+    const label = `${strategy} — ${samples} samples, ${run.rays} rays`;
+    el(`${strategy}Label`).textContent = label;
+    drawDispersionFrame(el(`${strategy}Frame`), {
+      estimate: run.estimate, display, anomalies: anomalies[strategy], label: strategy,
+    });
+    drawContributionChart(el(`${strategy}Contrib`), {
+      run, reference, spectralData: core.spectralData, label: `${strategy} Y(λ) vs reference`,
+      anomalies: run.estimate.coverage.unsupported,
+    });
+    const m = run.metrics;
+    const dEcl = m.globalDeltaE < 1 ? 'ok' : m.globalDeltaE < 3 ? 'warn' : 'err';
+    const omcl = m.omission <= 0.02 ? 'ok' : m.omission <= 0.1 ? 'warn' : 'err';
+    el(`${strategy}Stats`).innerHTML = `
+      <dt>colour ΔE76</dt><dd class="${dEcl}">${fmt(m.globalDeltaE)}</dd>
+      <dt>per-pixel ΔE (rms)</dt><dd>${fmt(m.pixelDeltaE)}</dd>
+      <dt>dark-band omission</dt><dd class="${omcl}">${(m.omission * 100).toFixed(2)}%</dd>
+      <dt>empty lit bins</dt><dd class="${m.darkBins > 0 ? 'warn' : ''}">${m.darkBins.toFixed(1)} / ${m.litBins}</dt>
+      <dt>ray cost</dt><dd>${run.rays}</dd>
+      <dt>proposal rays</dt><dd>${run.proposalRays}</dd>`;
+  }
+
+  el('strategyBudget').textContent = String(samples);
+  el('strategyCStar').textContent = rule ? fmt(rule.cStar) : '—';
+
+  // Verdict: show the measured comparison and the rule's decision, and mark the
+  // anomalies that actually show on the frames/contributions.
+  const f = runs.fixed.metrics;
+  const j = runs.joint.metrics;
+  const decision = rule ? (concentration >= rule.cStar ? 'fixed' : 'joint') : null;
+  const fixedCheaper = runs.fixed.rays <= runs.joint.rays;
+  const lowerError = f.globalDeltaE <= j.globalDeltaE ? 'fixed' : 'joint';
+  const anomalyBits = [];
+  const fixedEmpty = f.darkBins > 0.5;
+  const jointEmpty = j.darkBins > 0.5;
+  if (fixedEmpty) anomalyBits.push(`<span class="verdictErr">fixed leaves ${f.darkBins.toFixed(0)} lit bin(s) empty (dark-band omission ${(f.omission * 100).toFixed(1)}%)</span>`);
+  if (jointEmpty) anomalyBits.push(`<span class="verdictWarn">joint leaves ${j.darkBins.toFixed(0)} lit bin(s) empty (omission ${(j.omission * 100).toFixed(1)}%)</span>`);
+  const uncoveredF = runs.fixed.estimate.coverage.unsupported;
+  const uncoveredJ = runs.joint.estimate.coverage.unsupported;
+  if (uncoveredF.length) anomalyBits.push(`<span class="verdictErr">fixed: ${uncoveredF.length} unsupported band(s) marked on its contribution chart</span>`);
+  if (uncoveredJ.length) anomalyBits.push(`<span class="verdictWarn">joint: ${uncoveredJ.length} unsupported band(s) marked on its contribution chart</span>`);
+
+  const ruleText = rule
+    ? `Calibrated rule (in-repo calibration family at ${samples} samples): fixed when c = N·W/Lw &ge; ${fmt(rule.cStar)}. This light has W = ${fmt(width)} nm, c = ${fmt(concentration, 1)} &rarr; <b>${decision}</b>.`
+    : 'Rule unavailable (calibration failed); showing the measured comparison only.';
+
+  el('strategyVerdict').innerHTML = `
+    <div>${ruleText}</div>
+    <div>Measured: lower colour error &rarr; <b>${lowerError}</b>; cheaper rays &rarr; <b>${fixedCheaper ? 'fixed' : 'joint'}</b>. `
+    + `fixed ΔE ${fmt(f.globalDeltaE)} / ${runs.fixed.rays} rays; joint ΔE ${fmt(j.globalDeltaE)} / ${runs.joint.rays} rays.</div>
+    ${anomalyBits.length ? `<div>Anomalies: ${anomalyBits.join('; ')}.</div>` : '<div class="verdictOk">No empty lit bins or unsupported bands on either frame at this budget.</div>'}`;
+
+  if (state.strategyAuto) applyAutoSwitch();
+
+  // Expose the comparison for automated checks and the screenshot evidence.
+  window.__spectralLabStrategy = {
+    samples, rule, width, concentration, decision,
+    fixed: { dE: f.globalDeltaE, omission: f.omission, rays: runs.fixed.rays, darkBins: f.darkBins, unsupported: uncoveredF.length },
+    joint: { dE: j.globalDeltaE, omission: j.omission, rays: runs.joint.rays, darkBins: j.darkBins, unsupported: uncoveredJ.length },
+  };
+  setStrategyState('ok', `comparison ready — ${samples} samples/strategy, ${runs.fixed.rays}/${runs.joint.rays} rays, ${rule ? `c* ${fmt(rule.cStar)}` : 'no rule'}`);
+}
+
+// Auto-switch: when enabled and a comparison exists, make the live production
+// proposal match the rule's decision for this light, so "auto" actually changes
+// the rendered scene's sampling, not only the comparison labels.
+function applyAutoSwitch() {
+  if (!strategyComparison || strategyComparison.stale) return;
+  const decision = strategyComparison.decision
+    ?? (strategyComparison.concentration >= strategyComparison.rule.cStar ? 'fixed' : 'joint');
+  const desired = decision === 'fixed' ? 'uniform' : 'joint';
+  if (state.sampling !== desired) {
+    state.sampling = desired;
+    syncControls();
+    rebuild({ forceResample: true });
+  }
 }
 
 function debounce(fn, ms) {
@@ -466,8 +707,7 @@ function renderSpectrum() {
   });
 }
 
-function renderTopStats() {
-  const { display, sceneWhite } = scene;
+function renderTopStats() {  const { display, sceneWhite } = scene;
   const ref = lastReference;
   const xy = xyOfXyz(ref.xyz);
   const lum = ref.xyz[1];

@@ -163,6 +163,38 @@
       <p class="hint">Colour chips are the integrated XYZ of a single sample under the current output transform, not a raw wavelength-to-RGB ramp.</p>
     </section>
 
+    <section class="panel strategy" aria-label="Wavelength strategy comparison" id="strategyPanel">
+      <div class="strategyHead">
+        <h2>Wavelength strategy comparison &mdash; dispersion frame &amp; contributions</h2>
+        <div class="strategyState" id="strategyState" role="status" aria-live="polite"></div>
+      </div>
+      <p class="hint strategyHint">
+        Same traced prism, same sample budget. <b>Fixed</b> layering = independent equal strata over the whole window.
+        <b>Joint</b> response = source &times; traced throughput &times; sensor (x+y+z) &mdash; restricted, correlated sampling.
+        Anomalies are marked on the frames: hatched = lit bin with no sample (dark-band omission); amber column = unsupported wavelength band.
+      </p>
+      <div class="strategyControls">
+        <button id="runStrategyCompare" class="primary">Run comparison in this window</button>
+        <label class="strategyToggle"><input type="checkbox" id="strategyAuto" /> auto-switch by calibrated rule</label>
+        <span class="strategyBudget">budget <b id="strategyBudget">500</b> samples/strategy &middot; c<sub>star</sub> <b id="strategyCStar">&mdash;</b></span>
+      </div>
+      <div class="strategyGrid">
+        <div class="strategyCell">
+          <div class="strategyLabel" id="fixedLabel">fixed — idle</div>
+          <canvas id="fixedFrame" width="220" height="340"></canvas>
+          <canvas id="fixedContrib" width="400" height="130"></canvas>
+          <dl class="strategyStats" id="fixedStats"></dl>
+        </div>
+        <div class="strategyCell">
+          <div class="strategyLabel" id="jointLabel">joint — idle</div>
+          <canvas id="jointFrame" width="220" height="340"></canvas>
+          <canvas id="jointContrib" width="400" height="130"></canvas>
+          <dl class="strategyStats" id="jointStats"></dl>
+        </div>
+      </div>
+      <div class="strategyVerdict" id="strategyVerdict"></div>
+    </section>
+
     <section class="panel checks" aria-label="Verification">
       <h2>Verification</h2>
       <div id="checkList" class="checkList"></div>
